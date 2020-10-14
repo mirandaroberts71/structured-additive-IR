@@ -1,287 +1,198 @@
 #include "loop_nest.h"
 
+#include "llvm/ADT/SetVector.h"
+
 namespace sair {
 
-// A dependency of a Sair operation.
-struct Dependency {
-  // Operation the use operation depends on.
-  ComputeOp def;
-  // Dimensions of the def operation that must complete before the current
-  // instance of the use operation execute.
-  llvm::SmallBitVector def_only_dimensions;
-  // Dimensions of the use operation that cannot execute before the accessed
-  // instance of def is computed.
-  llvm::SmallBitVector use_only_dimensions;
-  // Dimension of the use operation that carry the dependency accross
-  // iterations. They must be fused with the dimensions of the def operation
-  // they map to.
-  llvm::SmallBitVector carrying_dimensions;
-  // Dimensions of the def operation that must complete at the previous
-  // iteration of `carrying_dimensions`. In practice, this means that they are
-  // nested in carrying dimensions.
-  llvm::SmallBitVector prev_def_only_dimensions;
-  // Point-to-point communication pattern from def to use.
-  AccessPatternAttr mapped_dimensions;
-};
+// Infers a new loop nest by applying the access pattern to dimensions of the
+// given pattern. Trims inner loops so than only loops iterating on dimensions
+// mapped by the access pattern remain.
+static mlir::ArrayAttr InferLoopNest(mlir::ArrayAttr loop_nest,
+                                     ValueOperand &operand) {
+  if (loop_nest == nullptr) return nullptr;
+  mlir::MLIRContext *context = loop_nest.getContext();
+  AccessPatternAttr access_pattern = operand.AccessPattern();
 
-static void AddDependencyFrom(
-    SairOp def, AccessPatternAttr access_pattern,
-    llvm::SmallBitVector def_only_dimensions,
-    llvm::SmallBitVector use_only_dimensions,
-    llvm::SmallBitVector carrying_dimensions,
-    llvm::SmallBitVector prev_def_only_dimensions, bool is_loop_carried,
-    llvm::SmallVectorImpl<Dependency> &dependencies,
-    llvm::SmallVectorImpl<llvm::SmallBitVector> &use_dim_dependencies);
-
-// Appends dependencies of `op` to the list of dependencies. Depdencies are
-// expressed in the domain of a user operation.
-// * `access_pattern`: the access pattern from `op` domain to the user domain.
-// * `def_only_dimension`, `use_only_dimensions`, `carrying_dimensions` and
-//   `prev_def_only_dimensions`: dimensions to add to the fields of the same
-//   name when creating the `Dependency` object.
-// * `is_loop_carried`: indicates if the dependency being built is a
-//   loop-carried dependency.
-// * `dependencies`: the list of dependencies to fill.
-// * `use_dim_dependencies`: dependencies on the dimensions of the use domain,
-//    to be filled by this function.
-static void AddDependencies(
-    SairOp op, AccessPatternAttr access_pattern,
-    const llvm::SmallBitVector &def_only_dimensions,
-    const llvm::SmallBitVector &use_only_dimensions,
-    const llvm::SmallBitVector &carrying_dimensions,
-    const llvm::SmallBitVector &prev_def_only_dimensions, bool is_loop_carried,
-    llvm::SmallVectorImpl<Dependency> &dependencies,
-    llvm::SmallVectorImpl<llvm::SmallBitVector> &use_dim_dependencies) {
-  assert(access_pattern.Dimensions().size() == op.domain().size());
-
-  auto add_dependency = [&](SairOp def, AccessPatternAttr def_access_pattern,
-                            const llvm::SmallBitVector &new_use_only_dimensions,
-                            const llvm::SmallBitVector &new_carrying_dimensions,
-                            bool new_is_loop_carried) {
-    AccessPatternAttr full_def_access_pattern =
-        def_access_pattern.Resize(def.domain().size());
-
-    llvm::SmallBitVector new_def_only_dimensions =
-        full_def_access_pattern.ApplyInverse(def_only_dimensions);
-    llvm::SmallBitVector new_prev_def_only_dimensions =
-        full_def_access_pattern.ApplyInverse(prev_def_only_dimensions);
-
-    // Otherwise, we need to compute transitive dependencies.
-    AccessPatternAttr new_access_pattern =
-        access_pattern.Compose(full_def_access_pattern);
-
-    AddDependencyFrom(def, new_access_pattern, new_def_only_dimensions,
-                      new_use_only_dimensions, new_carrying_dimensions,
-                      new_prev_def_only_dimensions, new_is_loop_carried,
-                      dependencies, use_dim_dependencies);
-  };
-
-  // Dimension dependencies are computed before entering the dimension.
-  for (int i = 0, e = op.domain().size(); i < e; ++i) {
-    SairOp def = op.domain()[i].getDefiningOp();
-    llvm::SmallBitVector new_use_only_dimensions = use_only_dimensions;
-    if (access_pattern.Dimension(i) != AccessPatternAttr::kNoDimension) {
-      new_use_only_dimensions.set(access_pattern.Dimension(i));
-    }
-    AccessPatternAttr dependency_pattern =
-        op.shape().Dimensions()[i].dependency_pattern();
-
-    add_dependency(def, dependency_pattern, new_use_only_dimensions,
-                   carrying_dimensions, is_loop_carried);
-  }
-
-  for (int i = 0, e = op.ValueOperands().size(); i < e; ++i) {
-    ValueOperand operand = op.ValueOperands()[i];
-    SairOp def = operand.value().getDefiningOp();
-    llvm::SmallBitVector new_carrying_dimensions =
-        access_pattern.Apply(op.CarryingDimensions(i)) | carrying_dimensions;
-    llvm::SmallBitVector new_use_only_dimensions =
-        access_pattern.Apply(op.DimsDependingOnOperand(i)) |
-        use_only_dimensions;
-
-    if (!operand.AllowUseBeforeDef()) {
-      add_dependency(def, operand.AccessPattern(), new_use_only_dimensions,
-                     new_carrying_dimensions, is_loop_carried);
+  llvm::SmallVector<mlir::Attribute, 4> new_loop_nest;
+  for (mlir::Attribute attr : loop_nest.getValue()) {
+    LoopAttr loop = attr.cast<LoopAttr>();
+    if (loop.iter().Rematerialize()) {
+      new_loop_nest.push_back(loop);
       continue;
     }
 
-    // If the operand is a loop-carried dependency, we force
-    // use-only dimensions to be nested in forced fused dimensions instead of
-    // putting them in use_only.
-    llvm::SmallBitVector empty_use_only_dimensions(use_only_dimensions.size());
-    for (int outer_dim : new_carrying_dimensions.set_bits()) {
-      for (int inner_dim : new_use_only_dimensions.set_bits()) {
-        use_dim_dependencies[inner_dim].set(outer_dim);
+    int dimension = loop.iter().Dimension();
+    if (dimension >= access_pattern.Dimensions().size()) {
+      break;
+    }
+
+    IteratorAttr new_iter =
+        IteratorAttr::get(context, access_pattern.Dimension(dimension));
+    LoopAttr new_loop = LoopAttr::get(loop.name(), new_iter, context);
+    new_loop_nest.push_back(new_loop);
+  }
+  // If the loop-nest is infered from loop-carried dimensions, trim inner
+  // parallel dimensions as they may be closed.
+  if (operand.AllowUseBeforeDef()) {
+    llvm::SmallBitVector carrying_dims = operand.CarryingDims();
+    while (!new_loop_nest.empty()) {
+      LoopAttr loop = new_loop_nest.back().cast<LoopAttr>();
+      if (!loop.iter().Rematerialize() &&
+          carrying_dims.test(loop.iter().Dimension())) {
+        break;
+      }
+      new_loop_nest.pop_back();
+    }
+  }
+  return mlir::ArrayAttr::get(new_loop_nest, context);
+}
+
+LoopNestAnalysis::LoopNestAnalysis(SairProgramOp program) {
+  for (mlir::Operation &op : program.body().front()) {
+    ComputeLoopNest(&op);
+  }
+}
+
+mlir::ArrayAttr LoopNestAnalysis::GetLoopNest(SairOp op) const {
+  return loop_nests_.find(op.getOperation())->second;
+}
+
+mlir::ArrayAttr LoopNestAnalysis::GetLoopNest(mlir::Value value) const {
+  return GetLoopNest(value.getDefiningOp());
+}
+
+mlir::ArrayAttr LoopNestAnalysis::ComputeLoopNest(mlir::Operation *operation) {
+  if(auto it = loop_nests_.find(operation); it != loop_nests_.end()) {
+    return it->second;
+  }
+
+  mlir::ArrayAttr loop_nest = nullptr;
+  if (auto compute_op = dyn_cast<ComputeOp>(operation)) {
+    loop_nest = compute_op.loop_nest().getValueOr(nullptr);
+  } else if (auto infer_loop_nest = dyn_cast<InferLoopNestOp>(operation)) {
+    // Temporarily set the loop nest to nullptr to avoid infinite recursion.
+    loop_nests_[operation] = nullptr;
+    int operand_pos = infer_loop_nest.infer_loop_nest_operand();
+    ValueOperand operand = cast<SairOp>(operation).ValueOperands()[operand_pos];
+    mlir::ArrayAttr parent_loop_nest =
+        ComputeLoopNest(operand.value().getDefiningOp());
+    loop_nest = InferLoopNest(parent_loop_nest, operand);
+  }
+  loop_nests_[operation] = loop_nest;
+  return loop_nest;
+}
+
+// Analysis that keeps track of dependencies between loops.
+class LoopNestConstraintsAnalysis {
+ public:
+  // Constraints for using a value.
+  struct Constraints {
+    // Dimensions opened by producers.
+    llvm::SetVector<mlir::Attribute> opened_loops;
+    // Dimensions closed by producers.
+    llvm::SetVector<mlir::Attribute> closed_loops;
+    // Dimensions of the value produced by closed loops.
+    llvm::SmallBitVector closed_dimensions;
+
+    Constraints(int domain_size) : closed_dimensions(domain_size) { }
+  };
+
+  explicit LoopNestConstraintsAnalysis(SairProgramOp program,
+                                       const LoopNestAnalysis &loop_nests) {
+    for (mlir::Operation &operation : program.body().front()) {
+      ComputeConstraints(&operation, loop_nests);
+    }
+  }
+
+  // Returns the constraints for using the given value.
+  const Constraints &GetConstraints(mlir::Value value) const {
+    return constraints_.find(value.getDefiningOp())->second;
+  }
+
+ private:
+  // Compute constraints for using values produced by the given operation.
+  const Constraints &ComputeConstraints(mlir::Operation *operation,
+                                        const LoopNestAnalysis &loop_nests) {
+    if (auto it = constraints_.find(operation); it != constraints_.end()) {
+      return it->second;
+    }
+
+    SairOp op = cast<SairOp>(operation);
+    int domain_size = op.domain().size();
+    Constraints constraints(domain_size);
+
+    auto inherit_constraints = [&](mlir::Value value,
+                                   AccessPatternAttr access_pattern,
+                                   bool loop_carried = false) {
+      const Constraints &parent_constraint =
+          ComputeConstraints(value.getDefiningOp(), loop_nests);
+      for (int closed_dim : parent_constraint.closed_dimensions.set_bits()) {
+        if (closed_dim > access_pattern.Dimensions().size()) break;
+        int op_dimension = access_pattern.Dimension(closed_dim);
+        constraints.closed_dimensions.set(op_dimension);
+      }
+      if (loop_carried) return;
+      constraints.opened_loops.set_union(parent_constraint.opened_loops);
+      constraints.closed_loops.set_union(parent_constraint.closed_loops);
+    };
+
+    if (!isa<ComputeOp>(operation)) {
+      // Store empty constraints to avoid infinite recursion.
+      constraints_.try_emplace(operation, domain_size);
+      for (int i = 0, e = domain_size; i < e; ++i) {
+        AccessPatternAttr access_pattern =
+            op.shape().Dimension(i).dependency_pattern();
+        inherit_constraints(op.domain()[i], access_pattern);
+      }
+      for (ValueOperand operand : op.ValueOperands()) {
+        if (operand.AllowUseBeforeDef()) {
+          inherit_constraints(operand.value(), operand.AccessPattern(), true);
+        } else {
+          inherit_constraints(operand.value(), operand.AccessPattern());
+        }
       }
     }
 
-    add_dependency(def, operand.AccessPattern(), empty_use_only_dimensions,
-                   new_carrying_dimensions, true);
-  }
-}
+    mlir::ArrayAttr loop_nest = loop_nests.GetLoopNest(operation);
+    if (loop_nest != nullptr) {
+      llvm::SmallBitVector closed_dims = op.ResultsDimDependencies();
+      bool closed_dims_seen = false;
+      for (mlir::Attribute attr : loop_nest.getValue()) {
+        LoopAttr loop = attr.cast<LoopAttr>();
+        constraints.opened_loops.insert(loop.name());
+        if (loop.iter().Rematerialize()) continue;
+        int dimension = loop.iter().Dimension();
+        if (closed_dims.test(dimension)) {
+          constraints.closed_loops.insert(loop.name());
+          closed_dims_seen = true;
+        }
+        if (closed_dims_seen && dimension < op.results_rank()) {
+          constraints.closed_dimensions.set(dimension);
+        }
+      }
+    }
 
-// Adds a dependency from `def` to the list of dependencies.
-static void AddDependencyFrom(
-    SairOp def, AccessPatternAttr access_pattern,
-    llvm::SmallBitVector def_only_dimensions,
-    llvm::SmallBitVector use_only_dimensions,
-    llvm::SmallBitVector carrying_dimensions,
-    llvm::SmallBitVector prev_def_only_dimensions, bool is_loop_carried,
-    llvm::SmallVectorImpl<Dependency> &dependencies,
-    llvm::SmallVectorImpl<llvm::SmallBitVector> &use_dim_dependencies) {
-  if (is_loop_carried) {
-    prev_def_only_dimensions |= def.ResultsDimDependencies();
-  } else {
-    def_only_dimensions |= def.ResultsDimDependencies();
-  }
-
-  // If the producer is a compute op, we can express the dependency
-  // directly on the producer.
-  ComputeOp compute_op = dyn_cast<ComputeOp>(def.getOperation());
-  if (compute_op != nullptr) {
-    dependencies.push_back({compute_op, def_only_dimensions,
-                            use_only_dimensions, carrying_dimensions,
-                            prev_def_only_dimensions, access_pattern});
-    return;
+    constraints_.erase(operation);
+    return constraints_.insert({operation, std::move(constraints)}).first->second;
   }
 
-  AddDependencies(def, access_pattern, def_only_dimensions, use_only_dimensions,
-                  carrying_dimensions, prev_def_only_dimensions,
-                  is_loop_carried, dependencies, use_dim_dependencies);
-}
+  llvm::DenseMap<mlir::Operation *, Constraints> constraints_;
+};
 
-// Adds dependencies of `op` to `dependencies` and for each dimension `di` of
-// `op`, adds the dimensions `di` must be nested in to
-// `dimension_dependencies[i]`.
-static void GetDependencies(
-    SairOp op, llvm::SmallVectorImpl<Dependency> &dependencies,
-    llvm::SmallVectorImpl<llvm::SmallBitVector> &dimension_dependencies) {
-  AccessPatternAttr access_pattern =
-      AccessPatternAttr::GetIdentity(op.getContext(), op.domain().size());
+// Verifies that the loop_nest attribute is correct with regard to the shape of
+// the operation it is attached to.
+static mlir::LogicalResult VerifyLoopNestWellFormed(
+    SairOp op, llvm::ArrayRef<mlir::Attribute> loop_nest) {
   int domain_size = op.domain().size();
-  llvm::SmallBitVector def_only_dimensions(domain_size);
-  llvm::SmallBitVector use_only_dimensions(domain_size);
-  llvm::SmallBitVector fuse_dimensions(domain_size);
-  llvm::SmallBitVector prev_def_only_dimensions(domain_size);
-  AddDependencies(op, access_pattern, def_only_dimensions, use_only_dimensions,
-                  fuse_dimensions, prev_def_only_dimensions, false,
-                  dependencies, dimension_dependencies);
-}
-
-// Checks that loop does not iterate along a dimension flagged in
-// `dependencies`. `op` is the operation of `loop` and `other_op` is the other
-// operation involved in the dependency.
-static mlir::LogicalResult CheckLoopDependency(
-    LoopAttr loop, const llvm::SmallBitVector &dependencies,
-    mlir::Operation *op, mlir::Operation *other_op) {
-  if (loop.iter().Rematerialize()) return mlir::success();
-  int dimension = loop.iter().Dimension();
-  if (!dependencies.test(dimension)) return mlir::success();
-  return (op->emitError() << "operation cannot be nested in loop "
-                          << loop.name())
-             .attachNote(other_op->getLoc())
-         << "because of this operation";
-}
-
-// Verifies that the dependency of `use` is satisfied.
-static mlir::LogicalResult VerifyDependency(
-    SairOp use, llvm::ArrayRef<mlir::Attribute> use_loop_nest,
-    Dependency &dependency) {
-  if (!dependency.def.loop_nest().hasValue()) return mlir::success();
-  llvm::ArrayRef<mlir::Attribute> def_loop_nest =
-      dependency.def.LoopNestLoops();
-
-  int min_size = std::min(use_loop_nest.size(), def_loop_nest.size());
-  for (int i = 0; i < min_size; ++i) {
-    LoopAttr use_loop = use_loop_nest[i].cast<LoopAttr>();
-    LoopAttr def_loop = def_loop_nest[i].cast<LoopAttr>();
-    if (use_loop.name() != def_loop.name()) break;
-
-    if (failed(CheckLoopDependency(use_loop, dependency.use_only_dimensions,
-                                   dependency.def, use)) ||
-        failed(CheckLoopDependency(def_loop, dependency.def_only_dimensions,
-                                   use, dependency.def))) {
-      return mlir::failure();
-    }
-
-    // Check mapped dimensions. If two dimensions are mapped by the access
-    // pattern, the def dimension must be fused with the use dimension
-    // or be in a separate loop nest.
-    if (def_loop.iter().Rematerialize()) continue;
-    int mapped_dimension =
-        dependency.mapped_dimensions.Dimension(def_loop.iter().Dimension());
-    if (mapped_dimension == AccessPatternAttr::kNoDimension) continue;
-    if (use_loop.iter().Rematerialize() ||
-        use_loop.iter().Dimension() != mapped_dimension) {
-      return (use.emitError()
-              << "loop " << use_loop.name() << " violates a data dependency")
-                 .attachNote(dependency.def.getLoc())
-             << "dependency from this operation";
-    }
-  }
-
-  // Check that dimensions that must be fused are fused.
-  int last_pref_def_only_dim = AccessPatternAttr::kNoDimension;
-  for (int i = 0, e = def_loop_nest.size(); i < e; ++i) {
-    LoopAttr def_loop = def_loop_nest[i].cast<LoopAttr>();
-    if (def_loop.iter().Rematerialize()) continue;
-    int def_dimension = def_loop.iter().Dimension();
-
-    if (dependency.prev_def_only_dimensions.test(def_dimension)) {
-      last_pref_def_only_dim = def_dimension;
-    }
-
-    int use_dimension = dependency.mapped_dimensions.Dimension(def_dimension);
-    if (use_dimension == AccessPatternAttr::kNoDimension ||
-        !dependency.carrying_dimensions.test(use_dimension)) {
-      continue;
-    }
-
-    if (last_pref_def_only_dim != AccessPatternAttr::kNoDimension) {
-      return dependency.def.emitError() << "dimension 'd" << def_dimension
-                                        << "' must be nested in dimension 'd"
-                                        << last_pref_def_only_dim << "'";
-    }
-
-    if (i < use_loop_nest.size()) {
-      LoopAttr use_loop = use_loop_nest[i].cast<LoopAttr>();
-      if (use_loop.name() == def_loop.name()) continue;
-    }
-
-    return (use.emitError()
-            << "operation must be fused with loop " << def_loop.name())
-               .attachNote(dependency.def.getLoc())
-           << "because of a dependency from this operation";
-  }
-
-  return mlir::success();
-}
-
-mlir::LogicalResult VerifyLoopNest(ComputeOp op) {
-  if (!op.loop_nest().hasValue()) return mlir::success();
-  llvm::ArrayRef<mlir::Attribute> loop_nest = op.LoopNestLoops();
-
-  SairProgramOp parent = dyn_cast<SairProgramOp>(op.getParentOp());
-  // Delegate checking that `parent` is a SairProgramOp to SairOp verifier.
-  if (parent == nullptr) return mlir::success();
-  SairOp sair_op = cast<SairOp>(op.getOperation());
-  int domain_size = sair_op.domain().size();
-
-  // Retrieve dependencies.
-  llvm::SmallVector<Dependency, 4> dependencies;
-  llvm::SmallVector<llvm::SmallBitVector, 4> dimension_dependencies;
-  dimension_dependencies.reserve(domain_size);
-  for (const DomainShapeDim &dim : sair_op.shape().Dimensions()) {
-    dimension_dependencies.push_back(dim.DependencyMask());
-    dimension_dependencies.back().resize(domain_size);
-  }
-  GetDependencies(sair_op, dependencies, dimension_dependencies);
-
   // Bitfield that keeps track of which dimensions are implemented by loops.
   llvm::SmallBitVector covered_dimensions(domain_size);
-  llvm::SmallVector<int, 8> steps(sair_op.domain().size(), -1);
+  llvm::SmallVector<int, 8> steps(domain_size, -1);
   for (int i = 0, e = loop_nest.size(); i < e; ++i) {
-    LoopAttr loop = loop_nest[i].cast<LoopAttr>();
+    LoopAttr loop = loop_nest[i].dyn_cast<LoopAttr>();
+    if (loop == nullptr) {
+      return op.emitError() << "expected a `Loop` attribute";
+    }
+    SairProgramOp parent = cast<SairProgramOp>(op.getParentOp());
     if (llvm::count(parent.loop_name_table(), loop.name()) == 0) {
       return op.emitError() << "loop " << loop.name()
                             << " is not declared in the parent operation";
@@ -298,8 +209,14 @@ mlir::LogicalResult VerifyLoopNest(ComputeOp op) {
     if (loop.iter().Rematerialize()) continue;
     int dimension = loop.iter().Dimension();
 
+    if (dimension >= domain_size) {
+      return op.emitError() << "dimension 'd" << loop.iter().Dimension() << "' "
+                            << "is out of range of the domain";
+    }
+
     llvm::SmallBitVector missing_outer_dims =
-        dimension_dependencies[dimension] & ~covered_dimensions;
+        op.shape().Dimensions()[dimension].DependencyMask() &
+        ~covered_dimensions;
     if (missing_outer_dims.any()) {
       return op.emitError()
              << "dependencies of dimension 'd" << dimension << "' "
@@ -323,88 +240,30 @@ mlir::LogicalResult VerifyLoopNest(ComputeOp op) {
     return op.emitError() << "not all dimensions are covered by the loop nest";
   }
 
-  for (Dependency &dependency : dependencies) {
-    if (mlir::failed(VerifyDependency(sair_op, loop_nest, dependency))) {
-      return mlir::failure();
-    }
-  }
-
   return mlir::success();
 }
 
-mlir::LogicalResult VerifyLoopNests(SairProgramOp program) {
-  struct FusionGroup {
-    mlir::StringAttr name;
-    mlir::Value dimension;
-    int step;
-    // If dimension == nullptr, contains the first operation referencing the
-    // loop. Otherwise, contains the first operation referencing the loop with
-    // the `iter` field set.
-    ComputeOp defining_op;
-    llvm::SmallVector<ComputeOp, 4> ops;
-  };
+namespace {
 
-  llvm::SmallVector<FusionGroup, 8> fusion_prefix;
-  llvm::DenseSet<mlir::Attribute> closed_groups;
-
-  auto close_groups = [&](int final_prefix_size) {
-    while (fusion_prefix.size() > final_prefix_size) {
-      FusionGroup group = fusion_prefix.pop_back_val();
-      if (group.dimension == nullptr) {
-        group.defining_op.emitError()
-            << "loop " << group.name
-            << " must have the 'iter' field set in at least one operation";
-        return mlir::failure();
-      }
-      for (ComputeOp op : group.ops) {
-        if (!group.dimension.getDefiningOp()->isBeforeInBlock(op)) {
-          (op.emitError() << "rematerialized loop " << group.name
-                          << " indirectly uses the range before it is defined")
-                  .attachNote(group.dimension.getLoc())
-              << "range defined here";
-          return mlir::failure();
-        }
-      }
-      closed_groups.insert(group.name);
-    }
-    return mlir::success();
-  };
-
-  mlir::WalkResult result = program.walk([&](ComputeOp op) {
-    if (!op.loop_nest().hasValue()) {
-      close_groups(0);
-      return mlir::WalkResult::advance();
-    }
-    llvm::ArrayRef<mlir::Attribute> loop_nest = op.LoopNestLoops();
-    SairOp sair_op = cast<SairOp>(op.getOperation());
-
-    // Check that dimensions are not out of range of the domain. We do this here
-    // rather than in ComputeOp as this verifier is run first and requires this
-    // property.
-    for (mlir::Attribute attr : loop_nest) {
-      LoopAttr loop = attr.dyn_cast<LoopAttr>();
-      if (loop == nullptr) return mlir::WalkResult::advance();
-
-      if (loop.iter().Rematerialize()) continue;
-      if (loop.iter().Dimension() >= sair_op.domain().size()) {
-        op.emitError() << "dimension 'd" << loop.iter().Dimension() << "' "
-                       << "is out of range of the domain";
-        return mlir::WalkResult::interrupt();
-      }
-    }
-
+// Helper class to track open loops and verify the loop structure forms a tree.
+class LoopNestState {
+ public:
+  // Updates the list of loops currently open and closed to accomodate the
+  // loop nest `loop_nest` of `op`. Returns a failure if the loop structure does
+  // not form a tree or if a loop is used before its range is defined.
+  mlir::LogicalResult Update(SairOp op, mlir::ArrayRef<mlir::Attribute> loop_nest) {
     // Find the number of common loops.
     int common_prefix_size = 0;
-    for (int e = std::min(loop_nest.size(), fusion_prefix.size());
+    for (int e = std::min(loop_nest.size(), open_groups_.size());
          common_prefix_size < e; ++common_prefix_size) {
       LoopAttr loop = loop_nest[common_prefix_size].cast<LoopAttr>();
-      FusionGroup &group = fusion_prefix[common_prefix_size];
+      FusionGroup &group = open_groups_[common_prefix_size];
       if (loop.name() != group.name) break;
 
       group.ops.push_back(op);
       if (loop.iter().Rematerialize()) continue;
 
-      mlir::Value dimension = sair_op.domain()[loop.iter().Dimension()];
+      mlir::Value dimension = op.domain()[loop.iter().Dimension()];
 
       // Set the group dimension if not already set.
       if (group.dimension == nullptr) {
@@ -416,43 +275,300 @@ mlir::LogicalResult VerifyLoopNests(SairProgramOp program) {
 
       // Ensure the loop definition matches the rest of the group.
       if (group.dimension != dimension || group.step != loop.iter().Step()) {
-        (op.emitError() << "loop " << group.name
+        return (op.emitError() << "loop " << group.name
                         << " dimension does not match previous occurrences")
                 .attachNote(group.defining_op.getLoc())
             << "previous occurrence here";
-        return mlir::WalkResult::interrupt();
       }
     }
 
     // Reset the current fusion prefix to the number of common loops.
-    if (mlir::failed(close_groups(common_prefix_size))) {
-      return mlir::WalkResult::interrupt();
-    }
+    if (mlir::failed(CloseLoops(common_prefix_size))) return mlir::failure();
 
     // Add remaining loops to the current fusion prefix.
     for (mlir::Attribute attribute : loop_nest.drop_front(common_prefix_size)) {
       LoopAttr loop = attribute.cast<LoopAttr>();
 
-      if (closed_groups.count(loop.name()) > 0) {
-        op.emitError() << "occurrences of loop " << loop.name()
-                       << " must be contiguous and nested in the same loops";
-        return mlir::WalkResult::interrupt();
+      if (closed_groups_.count(loop.name()) > 0) {
+        return op.emitError()
+               << "occurrences of loop " << loop.name()
+               << " must be contiguous and nested in the same loops";
       }
 
-      FusionGroup &group = fusion_prefix.emplace_back();
+      FusionGroup &group = open_groups_.emplace_back();
       group.name = loop.name();
       group.defining_op = op;
       group.ops.push_back(op);
 
       if (loop.iter().Rematerialize()) continue;
-      group.dimension = sair_op.domain()[loop.iter().Dimension()];
+      group.dimension = op.domain()[loop.iter().Dimension()];
       group.step = loop.iter().Step();
+    }
+    return mlir::success();
+  }
+
+  // Mark loops as closed, starting from the innermost`, until only
+  // `num_remaining_loops` are left open.
+  mlir::LogicalResult CloseLoops(int num_remaining_loops = 0) {
+    while (open_groups_.size() > num_remaining_loops) {
+      FusionGroup group = open_groups_.pop_back_val();
+      if (group.dimension == nullptr) {
+        group.defining_op.emitError()
+            << "loop " << group.name
+            << " must have the 'iter' field set in at least one operation";
+        return mlir::failure();
+      }
+      for (SairOp op : group.ops) {
+        if (!group.dimension.getDefiningOp()->isBeforeInBlock(op)) {
+          (op.emitError() << "rematerialized loop " << group.name
+                          << " indirectly uses the range before it is defined")
+                  .attachNote(group.dimension.getLoc())
+              << "range defined here";
+          return mlir::failure();
+        }
+      }
+      closed_groups_.insert(group.name);
+    }
+    return mlir::success();
+  };
+
+  // Verifies that the given loops have been opened before.
+  mlir::LogicalResult VerifyLoopsOpened(
+      const llvm::SetVector<mlir::Attribute> &loops, mlir::Location loc) const {
+    for (mlir::Attribute loop : loops) {
+      if (closed_groups_.contains(loop)) continue;
+      if (llvm::any_of(open_groups_, [&](const FusionGroup &group) {
+            return group.name == loop;
+          })) {
+        continue;
+      }
+      return mlir::emitError(loc)
+             << "loop " << loop
+             << " must be opened at or before this operation";
+    }
+    return mlir::success();
+  }
+
+ private:
+  struct FusionGroup {
+    mlir::StringAttr name;
+    mlir::Value dimension;
+    int step;
+    // If dimension == nullptr, contains the first operation referencing the
+    // loop. Otherwise, contains the first operation referencing the loop with
+    // the `iter` field set.
+    SairOp defining_op;
+    llvm::SmallVector<SairOp, 4> ops;
+  };
+
+  llvm::SmallVector<FusionGroup, 8> open_groups_;
+  llvm::DenseSet<mlir::Attribute> closed_groups_;
+};
+
+}  // namespace
+
+// Verifies that dimensions that must be opened before executing `op` are indeed
+// open in the loop nest state.
+static mlir::LogicalResult VerifyLoopsOpened(
+    SairOp op, const LoopNestState &loop_nest_state,
+    const LoopNestConstraintsAnalysis &loop_constaints_analysis) {
+  for (mlir::Value dimension : op.domain()) {
+    const auto &constraints =
+        loop_constaints_analysis.GetConstraints(dimension);
+    if (mlir::failed(
+            loop_nest_state.VerifyLoopsOpened(constraints.opened_loops, op.getLoc()))) {
+      return mlir::failure();
+    }
+  }
+  for (ValueOperand operand : op.ValueOperands()) {
+    const auto &constraints =
+        loop_constaints_analysis.GetConstraints(operand.value());
+    if (mlir::failed(
+            loop_nest_state.VerifyLoopsOpened(constraints.opened_loops, op.getLoc()))) {
+      return mlir::failure();
+    }
+  }
+  return mlir::success();
+}
+
+// Verifies that the loop nest `op_loop_nest` of `op` is compatible with the
+// constraints imposed by the operand `dependency` of `op`.
+// * `access_pattern`: the access pattern used by `op` to access `dependency`.
+// * `dim_dependencies`: dimensions of `op` that cannot be part of the loop-nest
+//    producing `dependency`.
+// * `carrying_dims`: if `dependency` is a loop-carried operand, lists
+//    dimensions carrying the value of `dependency` accross iterations.
+static mlir::LogicalResult VerifyDependency(
+    SairOp op, mlir::ArrayAttr op_loop_nest,
+    mlir::Value dependency, AccessPatternAttr access_pattern,
+    const llvm::SmallBitVector &dim_dependencies,
+    const llvm::SmallBitVector &carrying_dims,
+    const LoopNestAnalysis &loop_nest_analysis,
+    const LoopNestConstraintsAnalysis &loop_constraints_analysis) {
+  mlir::ArrayAttr dep_loop_nest = loop_nest_analysis.GetLoopNest(dependency);
+  if (dep_loop_nest == nullptr) return mlir::success();
+
+  // Verify dependencies with the operand loop nest.
+  for (auto [op_attr, dep_attr] :
+       llvm::zip(op_loop_nest.getValue(), dep_loop_nest.getValue())) {
+    LoopAttr op_loop = op_attr.cast<LoopAttr>();
+    LoopAttr dep_loop = dep_attr.cast<LoopAttr>();
+    if (op_loop.name() != dep_loop.name()) break;
+
+    // Check mapped dimensions. If two dimensions are mapped by the access
+    // pattern, the op dimension must be fused with the operand dimension
+    // or be in a separate loop nest.
+    if (dep_loop.iter().Rematerialize()) continue;
+    int dep_dimension = dep_loop.iter().Dimension();
+    if (dep_dimension >= access_pattern.Dimensions().size()) continue;
+    int mapped_dimension = access_pattern.Dimension(dep_dimension);
+    if (mapped_dimension == AccessPatternAttr::kNoDimension) continue;
+    if (op_loop.iter().Rematerialize() ||
+        op_loop.iter().Dimension() != mapped_dimension) {
+      return (op.emitError()
+              << "loop " << op_loop.name() << " violates a data dependency")
+                 .attachNote(dependency.getLoc())
+             << "dependency from this operation";
+    }
+  }
+
+  const LoopNestConstraintsAnalysis::Constraints &constraints =
+      loop_constraints_analysis.GetConstraints(dependency);
+  for (mlir::Attribute attr : op_loop_nest) {
+    LoopAttr loop = attr.cast<LoopAttr>();
+    if (constraints.closed_loops.contains(loop.name())) {
+      return op.emitError()
+             << "loop " << loop.name() << " must be closed before this operation";
+    }
+
+    if (loop.iter().Rematerialize()) continue;
+    if (!dim_dependencies.test(loop.iter().Dimension())) continue;
+    if (!constraints.opened_loops.contains(loop.name())) continue;
+
+    return (dependency.getDefiningOp()->emitError()
+            << "operation cannot be nested in loop " << loop.name())
+               .attachNote(op.getLoc())
+           << "because of this operation";
+  }
+
+  for (int dep_dimension : constraints.closed_dimensions.set_bits()) {
+    int op_dimension = access_pattern.Dimension(dep_dimension);
+    if (carrying_dims.test(op_dimension)) {
+      return op.emitError()
+          << "cannot take the previous value of the operand along 'd" << op_dimension
+          << "' because of the operand loop nest";
+    }
+  }
+
+  return mlir::success();
+}
+
+// Verifies that the loop nest of `op` is compatible with the constraints
+// imposed by its dependencies.
+static mlir::LogicalResult VerifyDependencies(
+    SairOp op, LoopNestAnalysis &loop_nest_analysis,
+    LoopNestConstraintsAnalysis &loop_constaints_analysis) {
+  mlir::ArrayAttr loop_nest = loop_nest_analysis.GetLoopNest(op);
+  if (loop_nest == nullptr) return mlir::success();
+
+  int domain_size = op.domain().size();
+  for (int i = 0; i < domain_size; ++i) {
+    llvm::SmallBitVector dim_dependencies(op.domain().size());
+    llvm::SmallBitVector carrying_dims(op.domain().size());
+    dim_dependencies.set(i);
+    AccessPatternAttr access_pattern =
+        op.shape().Dimensions()[i].dependency_pattern();
+    if (mlir::failed(VerifyDependency(
+            op, loop_nest, op.domain()[i], access_pattern, dim_dependencies,
+            carrying_dims, loop_nest_analysis, loop_constaints_analysis))) {
+      return mlir::failure();
+    }
+  }
+
+  for (ValueOperand operand : op.ValueOperands()) {
+    if (mlir::failed(VerifyDependency(
+            op, loop_nest, operand.value(), operand.AccessPattern(),
+            operand.DependingDims(), operand.CarryingDims(), loop_nest_analysis,
+            loop_constaints_analysis))) {
+      return mlir::failure();
+    }
+  }
+
+  return mlir::success();
+}
+
+// Returns mlir::WalkResult::interupt() if the result is a failure.
+static mlir::WalkResult InterruptOnFailure(mlir::LogicalResult result) {
+  return mlir::succeeded(result) ? mlir::WalkResult::advance()
+                                 : mlir::WalkResult::interrupt();
+}
+
+mlir::LogicalResult VerifyLoopNests(SairProgramOp program) {
+  // Verify operands of Sair operands are defined in the same program. This
+  // check is performed here rather that in SairOp as it is needed for other
+  // verifications.
+  mlir::WalkResult result = program.walk([&](SairOp op) {
+    for (mlir::Value dimension : op.domain()) {
+      mlir::Operation *defining_op = dimension.getDefiningOp();
+      if (defining_op == nullptr || defining_op->getParentOp() != program) {
+        op.emitError()
+             << "sair dimensions must be defined in the region they are used";
+        return mlir::WalkResult::interrupt();
+      }
+    }
+    for (ValueOperand operand : op.ValueOperands()) {
+      mlir::Operation *defining_op = operand.value().getDefiningOp();
+      if (defining_op == nullptr || defining_op->getParentOp() != program) {
+        op.emitError()
+             << "sair values must be defined in the region they are used";
+        return mlir::WalkResult::interrupt();
+      }
     }
     return mlir::WalkResult::advance();
   });
   if (result.wasInterrupted()) return mlir::failure();
 
-  return close_groups(0);
+
+  // Verify loop nests are correct with regard to their operation.
+  result = program.walk([](ComputeOp op) {
+    if (!op.loop_nest().hasValue()) return mlir::WalkResult::advance();
+    mlir::LogicalResult result = VerifyLoopNestWellFormed(
+        cast<SairOp>(op.getOperation()), op.LoopNestLoops());
+    return InterruptOnFailure(result);
+  });
+  if (result.wasInterrupted()) return mlir::failure();
+
+  LoopNestAnalysis loop_nest_analysis(program);
+  LoopNestConstraintsAnalysis loop_constraints_analysis(program, loop_nest_analysis);
+
+  // Verify that the loop structure forms a tree.
+  LoopNestState loop_nest_state;
+  result = program.walk([&](ComputeOp op) {
+    if (op.loop_nest().hasValue()) {
+      if (mlir::failed(loop_nest_state.Update(cast<SairOp>(op.getOperation()),
+                                              op.LoopNestLoops()))) {
+        return mlir::WalkResult::interrupt();
+      }
+    } else if (mlir::failed(loop_nest_state.CloseLoops())) {
+        return mlir::WalkResult::interrupt();
+    }
+    mlir::LogicalResult result =
+        VerifyLoopsOpened(cast<SairOp>(op.getOperation()), loop_nest_state,
+                          loop_constraints_analysis);
+    return InterruptOnFailure(result);
+  });
+  if (result.wasInterrupted()) return mlir::failure();
+  if (mlir::failed(loop_nest_state.CloseLoops())) return mlir::failure();
+
+  // Verify dependencies.
+  result = program.walk([&](SairOp op) {
+    mlir::LogicalResult result =
+        VerifyDependencies(op, loop_nest_analysis, loop_constraints_analysis);
+    return InterruptOnFailure(result);
+  });
+  if (result.wasInterrupted()) return mlir::failure();
+
+  return mlir::success();
 }
 
 }  // namespace sair

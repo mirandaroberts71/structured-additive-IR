@@ -340,11 +340,23 @@ def SairComputeOp : OpInterface<"ComputeOp"> {
     >
   ];
 
-  let verify = [{return sair::VerifyComputeOp(op);}];
-
   let extraClassDeclaration = [{
     static constexpr llvm::StringRef kLoopNestAttrName = "loop_nest";
   }];
+}
+
+def SairInferLoopNestOp : OpInterface<"InferLoopNestOp"> {
+  let description = [{
+    A Sair operation whose loop nest is infered from the loop nest of an
+    operand.
+  }];
+
+  let methods = [
+    InterfaceMethod<
+      "Position of the Sair value operand to inherit the loop nest from.",
+      "int", "infer_loop_nest_operand"
+    >
+  ];
 }
 
 def SairRangeOp : OpInterface<"RangeOp"> {
