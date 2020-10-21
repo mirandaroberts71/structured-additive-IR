@@ -418,6 +418,7 @@ def SairMapReduceOp : SairOp<"map_reduce", [
 class SairProjectionOp<string name> : SairOp<name, [
     AttrSizedOperandSegments,
     NoSideEffect,
+    SairInferLoopNestOp,
     SairSameElementType<"value", "result">,
     SairValueProducerOp]> {
   let arguments = (ins
@@ -442,6 +443,8 @@ class SairProjectionOp<string name> : SairOp<name, [
     }
 
     ValueOperand Value() { return ValueOperands()[0]; }
+
+    int infer_loop_nest_operand() { return 0; }
   }];
 }
 
@@ -486,6 +489,7 @@ def SairProjLastOp : SairProjectionOp<"proj_last"> {
 def SairFbyOp : SairOp<"fby", [
     AttrSizedOperandSegments,
     NoSideEffect,
+    SairInferLoopNestOp,
     SairOneResult,
     SairSameElementType<"value", "init">,
     SairSameElementType<"value", "result">,
@@ -534,6 +538,8 @@ def SairFbyOp : SairOp<"fby", [
     ValueOperand Init() { return ValueOperands()[0]; }
 
     ValueOperand Value() { return ValueOperands()[1]; }
+
+    int infer_loop_nest_operand() { return 1; }
   }];
 }
 
